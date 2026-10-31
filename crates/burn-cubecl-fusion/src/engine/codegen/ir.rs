@@ -199,7 +199,8 @@ pub enum FuseOp {
         inputs: Vec<FuseArg>,
         output: FuseArg,
         dim: usize,
-        /// Metadata position for unequal input boundaries; absent for equal inputs.
+        /// Launch metadata position, computed for unequal inputs during launch preparation.
+        /// `None` before preparation or when the input lengths are equal.
         #[serde(default)]
         boundaries_start: Option<usize>,
     },
