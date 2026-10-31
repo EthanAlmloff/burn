@@ -1,68 +1,84 @@
 //! Measures fused concatenation, including host preparation and device completion.
+//!
+//! Targets are total output element counts. Minimum segment sizes and alignment can
+//! make small outputs exceed the target when concatenating many inputs.
+//!
+//! Run with:
+//! ```bash
+//! cargo bench -p burn-backend-tests --bench fused_cat --features cuda,fusion
+//! ```
+
+#[path = "common/mod.rs"]
+mod common;
+use common::BencherExt;
 
 use burn_fusion::inspect::{BlockKind, FusionInspector, matchers};
 use burn_tensor::{Device, StreamId, Tensor, TensorData};
 use divan::Bencher;
 
-const CASES: [usize; 252] = {
-    let mut cases = [0; 252];
-    let mut i = 0;
-    while i < cases.len() {
-        cases[i] = i;
-        i += 1;
-    }
-    cases
-};
+#[cfg(not(feature = "bench-disable-alloc"))]
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 
 fn main() {
+    println!("Fused concatenation benchmarks");
+    println!();
     divan::main();
+    common::report_failures();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Pattern {
+    Equal,
+    Repeating,
+    LargeFirst,
+    LargeLast,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Layout {
+    WholeVector,
+    AlignedAxis,
+    UnalignedAxis,
 }
 
 /// Inputs and output have rank two. `dim` joins segments; the other axis preserves its length.
-#[divan::bench(args = CASES, sample_count = 100)]
-fn fused_cat(bencher: Bencher, case: usize) {
-    let (count, pattern, layout, size) = if case < 144 {
-        (
-            [2, 5, 16, 32][case % 4],
-            case / 4 % 4,
-            case / 16 % 3,
-            case / 48,
-        )
-    } else {
-        let extended = case - 144;
-        (
-            [64, 128, 256][extended % 3],
-            extended / 3 % 4,
-            extended / 12 % 3,
-            extended / 36,
-        )
-    };
-    let target_elements = [1024, 65536, 4194304][size];
+fn bench_cat(
+    bencher: Bencher,
+    count: usize,
+    pattern: Pattern,
+    layout: Layout,
+    target_elements: usize,
+) {
     let mut lengths: Vec<usize> = (0..count)
         .map(|i| match pattern {
-            0 => 4,
-            1 => [1, 2, 5, 6, 3][i % 5],
-            2 if i == 0 => count * 8 + 1,
-            3 if i == count - 1 => count * 8 + 1,
+            Pattern::Equal => 4,
+            Pattern::Repeating => [1, 2, 5, 6, 3][i % 5],
+            Pattern::LargeFirst if i == 0 => count * 8 + 1,
+            Pattern::LargeLast if i == count - 1 => count * 8 + 1,
             _ => 1,
         })
         .collect();
-    if layout == 1 {
-        for length in &mut lengths {
-            *length *= 4;
+    match layout {
+        Layout::WholeVector => {}
+        Layout::AlignedAxis => {
+            for length in &mut lengths {
+                *length *= 4;
+            }
         }
-    } else if layout == 2 {
-        // Keep the total aligned while leaving internal boundaries inside vectors.
-        let total: usize = lengths.iter().sum();
-        lengths[count - 1] += (4 - total % 4) % 4;
+        Layout::UnalignedAxis => {
+            // Keep the total aligned while leaving internal boundaries inside vectors.
+            let total: usize = lengths.iter().sum();
+            lengths[count - 1] += (4 - total % 4) % 4;
+        }
     }
     let total: usize = lengths.iter().sum();
-    let other = if layout == 0 {
+    let other = if matches!(layout, Layout::WholeVector) {
         (target_elements / total / 4).max(1) * 4
     } else {
         (target_elements / total).max(1)
     };
-    let dim = usize::from(layout != 0);
+    let dim = usize::from(!matches!(layout, Layout::WholeVector));
     let stream = StreamId::allocate();
 
     stream.executes(|| {
@@ -117,18 +133,53 @@ fn fused_cat(bencher: Bencher, case: usize) {
                             .iter()
                             .any(matchers::is_mul_scalar_float(inputs[0].dtype()))
                 }),
-                "case {case} did not fuse concat and multiplication: {reports:?}"
+                "{pattern:?}, {layout:?}, {count} inputs, target {target_elements}: \
+                 concat and multiplication did not fuse: {reports:?}"
             );
         }
 
-        for _ in 0..5 {
-            let _output = Tensor::cat(inputs.clone(), dim).mul_scalar(2.0);
-            device.sync().unwrap();
-        }
-        bencher.bench(|| {
-            let output = Tensor::cat(inputs.clone(), dim).mul_scalar(2.0);
-            device.sync().unwrap();
-            output
-        });
+        bencher.bench_synced(|| Tensor::cat(inputs.clone(), dim).mul_scalar(2.0));
     });
 }
+
+macro_rules! bench_layout {
+    ($name:ident, $pattern:expr, $layout:expr) => {
+        #[divan::bench_group]
+        mod $name {
+            use super::*;
+
+            #[divan::bench(args = [2, 5, 16, 32, 64, 128, 256])]
+            fn target_1k(bencher: Bencher, count: usize) {
+                bench_cat(bencher, count, $pattern, $layout, 1024);
+            }
+
+            #[divan::bench(args = [2, 5, 16, 32, 64, 128, 256])]
+            fn target_64k(bencher: Bencher, count: usize) {
+                bench_cat(bencher, count, $pattern, $layout, 65536);
+            }
+
+            #[divan::bench(args = [2, 5, 16, 32, 64, 128, 256])]
+            fn target_4m(bencher: Bencher, count: usize) {
+                bench_cat(bencher, count, $pattern, $layout, 4194304);
+            }
+        }
+    };
+}
+
+macro_rules! bench_pattern {
+    ($name:ident, $pattern:expr) => {
+        #[divan::bench_group]
+        mod $name {
+            use super::*;
+
+            bench_layout!(whole_vector, $pattern, Layout::WholeVector);
+            bench_layout!(aligned_axis, $pattern, Layout::AlignedAxis);
+            bench_layout!(unaligned_axis, $pattern, Layout::UnalignedAxis);
+        }
+    };
+}
+
+bench_pattern!(equal, Pattern::Equal);
+bench_pattern!(repeating, Pattern::Repeating);
+bench_pattern!(large_first, Pattern::LargeFirst);
+bench_pattern!(large_last, Pattern::LargeLast);
