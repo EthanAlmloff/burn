@@ -199,6 +199,9 @@ pub enum FuseOp {
         inputs: Vec<FuseArg>,
         output: FuseArg,
         dim: usize,
+        /// Metadata position for unequal input boundaries; absent for equal inputs.
+        #[serde(default)]
+        boundaries_start: Option<usize>,
     },
     Dequantize {
         values: FuseArg,
@@ -289,6 +292,7 @@ impl Display for FuseOp {
                 inputs,
                 output,
                 dim,
+                boundaries_start: _,
             } => {
                 write!(f, "{output} = cat(inputs=[")?;
                 for (i, input) in inputs.iter().enumerate() {
@@ -382,6 +386,8 @@ pub struct GlobalArgs {
     /// When there are no metadata as a reference layout, we provide runtime shape/strides in this
     /// sequence instead.
     pub runtime_layouts: Sequence<usize>,
+    /// Cumulative concat lengths, excluding the first input's implicit start and the final total.
+    pub concat_boundaries: Sequence<usize>,
     /// Variables shared between blocks.
     pub variables: MultiBlockVariables,
 }
@@ -476,6 +482,7 @@ impl Default for GlobalArgsLaunch {
             reshapes: Default::default(),
             variables: Default::default(),
             runtime_layouts: Default::default(),
+            concat_boundaries: Default::default(),
         }
     }
 }
@@ -808,6 +815,7 @@ impl FuseOp {
                 inputs,
                 output,
                 dim: _,
+                boundaries_start: _,
             } => {
                 for input in inputs {
                     input.multi_block_variable(registers);

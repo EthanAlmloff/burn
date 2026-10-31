@@ -599,6 +599,7 @@ mod tests {
         let mut registered = select(fuser, table);
         let out = tensor(3, &[table.shape[0] * 2, COLS], DType::F32);
         let op = FuseOp::Cat {
+            boundaries_start: None,
             inputs: vec![fuser.input_indexed(table).unwrap(); 2],
             output: fuser.output(&out).unwrap(),
             dim: 0,

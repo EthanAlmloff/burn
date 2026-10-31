@@ -151,7 +151,32 @@ impl<'a> LaunchPlanExecutor<'a> {
             }
 
             for op in block.ops.iter() {
-                ops.push(op.clone());
+                let mut op = op.clone();
+                if let FuseOp::Cat {
+                    inputs: tensors,
+                    dim,
+                    boundaries_start,
+                    ..
+                } = &mut op
+                {
+                    *boundaries_start = None;
+                    if let Some(first) = tensors.first() {
+                        let first_size = inputs.shape(first)[*dim];
+                        let unequal = tensors
+                            .iter()
+                            .skip(1)
+                            .any(|tensor| inputs.shape(tensor)[*dim] != first_size);
+                        if unequal {
+                            *boundaries_start = Some(inputs.concat_boundaries.values.len());
+                            let mut end = 0;
+                            for tensor in tensors.iter().take(tensors.len() - 1) {
+                                end += inputs.shape(tensor)[*dim];
+                                inputs.concat_boundaries.push(end);
+                            }
+                        }
+                    }
+                }
+                ops.push(op);
             }
 
             for opsw in block_plan.writes.into_values() {

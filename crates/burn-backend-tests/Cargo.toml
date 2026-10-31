@@ -109,6 +109,11 @@ name = "cat_max_min_ops"
 harness = false
 
 [[bench]]
+name = "fused_cat"
+harness = false
+required-features = ["fusion", "cube"]
+
+[[bench]]
 name = "comparison_ops"
 harness = false
 

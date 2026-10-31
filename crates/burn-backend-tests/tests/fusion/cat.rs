@@ -455,3 +455,144 @@ fn cat_outputs_of_different_shapes_read_their_own_inputs() {
         );
     });
 }
+
+/// Returns rank-two inputs joined along `dim` and the expected output after adding one.
+/// The other axis has length four. Transposed storage preserves the logical input shapes.
+fn unequal_cat_fixture(
+    lengths: &[usize],
+    dim: usize,
+    transposed: bool,
+    device: &Device,
+) -> (Vec<TestTensor<2>>, TensorData) {
+    let inputs = lengths
+        .iter()
+        .enumerate()
+        .map(|(source, &length)| {
+            let shape = if dim == 0 { [length, 4] } else { [4, length] };
+            let stored = if transposed {
+                [shape[1], shape[0]]
+            } else {
+                shape
+            };
+            let values = (0..stored[0] * stored[1])
+                .map(|index| {
+                    let (row, col) = if transposed {
+                        (index % stored[1], index / stored[1])
+                    } else {
+                        (index / stored[1], index % stored[1])
+                    };
+                    (source * 1000 + row * 32 + col) as f32
+                })
+                .collect();
+            let tensor = TestTensor::from_data(TensorData::new(values, stored), device);
+            if transposed {
+                tensor.swap_dims(0, 1)
+            } else {
+                tensor
+            }
+        })
+        .collect();
+    let total: usize = lengths.iter().sum();
+    let shape = if dim == 0 { [total, 4] } else { [4, total] };
+    let values = (0..shape[0] * shape[1])
+        .map(|index| {
+            let mut row = index / shape[1];
+            let mut col = index % shape[1];
+            let coordinate = if dim == 0 { row } else { col };
+            let mut start = 0;
+            let source = lengths
+                .iter()
+                .position(|length| {
+                    if coordinate < start + length {
+                        true
+                    } else {
+                        start += length;
+                        false
+                    }
+                })
+                .unwrap();
+            if dim == 0 {
+                row -= start;
+            } else {
+                col -= start;
+            }
+            (source * 1000 + row * 32 + col + 1) as f32
+        })
+        .collect();
+    (inputs, TensorData::new(values, shape))
+}
+
+#[test]
+fn cat_unequal_boundaries_refresh_and_preserve_strides() {
+    let stream = test_stream();
+    stream.executes(|| {
+        let device = Device::default();
+        for transposed in [false, true] {
+            for dim in 0..2 {
+                for lengths in [
+                    &[1, 2, 5, 6, 3][..],
+                    &[3, 6, 5, 2, 1][..],
+                    &[1, 2, 5, 6, 6][..],
+                    &[0, 1, 0, 2, 5, 0, 6, 3, 0][..],
+                ] {
+                    let (inputs, expected) = unequal_cat_fixture(lengths, dim, transposed, &device);
+                    device.sync().unwrap();
+
+                    let inspector = FusionInspector::install(stream);
+                    TestTensor::cat(inputs, dim)
+                        .add_scalar(1.0)
+                        .into_data()
+                        .assert_approx_eq::<FloatElem>(&expected, Tolerance::default());
+                    device.sync().unwrap();
+                    let reports = inspector.drain();
+                    assert!(
+                        reports.iter().flat_map(|r| &r.blocks).any(|block| {
+                            matches!(block.kind, BlockKind::Fused { .. })
+                                && block.operations.iter().any(matchers::is_cat())
+                        }),
+                        "unequal concat did not fuse: {reports:?}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn cat_unequal_operations_keep_separate_boundaries() {
+    let stream = test_stream();
+    stream.executes(|| {
+        let device = Device::default();
+        let (left, left_expected) = unequal_cat_fixture(&[1, 2, 5, 6, 3], 0, false, &device);
+        let (right, right_expected) = unequal_cat_fixture(&[3, 6, 5, 2, 1], 0, false, &device);
+        let expected = left_expected
+            .as_slice::<f32>()
+            .unwrap()
+            .iter()
+            .zip(right_expected.as_slice::<f32>().unwrap())
+            .map(|(left, right)| left + right)
+            .collect();
+        device.sync().unwrap();
+
+        let inspector = FusionInspector::install(stream);
+        let output = (TestTensor::cat(left, 0) + TestTensor::cat(right, 0)).add_scalar(2.0);
+        output.into_data().assert_approx_eq::<FloatElem>(
+            &TensorData::new(expected, [17, 4]),
+            Tolerance::default(),
+        );
+        device.sync().unwrap();
+        let reports = inspector.drain();
+        assert!(
+            reports.iter().flat_map(|r| &r.blocks).any(|block| {
+                matches!(block.kind, BlockKind::Fused { .. })
+                    && block
+                        .operations
+                        .iter()
+                        .filter(|op| matchers::is_cat()(op))
+                        .count()
+                        == 2
+            }),
+            "two concats did not share a fused block: {reports:?}"
+        );
+    });
+}

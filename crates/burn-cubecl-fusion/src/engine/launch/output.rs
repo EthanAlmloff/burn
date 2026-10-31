@@ -1102,6 +1102,7 @@ mod tests {
 
     fn cat_op(inputs: &[usize], dim: usize) -> FuseOp {
         FuseOp::Cat {
+            boundaries_start: None,
             inputs: inputs.iter().copied().map(arg).collect(),
             output: FuseArg::Output(0, FuseType::F32, LayoutInfo::IsRef),
             dim,

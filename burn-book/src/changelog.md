@@ -79,6 +79,8 @@ positions when sequence lengths differ.
 
 #### Kernels
 
+- Select unequal-size fused concatenation inputs with binary search over host-computed boundaries.
+  Code constructing `FuseOp::Cat` directly must add `boundaries_start: None`.
 - Avoid a full-sized gradient copy in CubeCL FP32 `conv2d` bias backward, while retaining
   single-pass accumulation for FP16/BF16 to avoid intermediate overflow.
   ([#6173](https://github.com/tracel-ai/burn/pull/6173))
